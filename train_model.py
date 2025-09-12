@@ -1,100 +1,116 @@
 # train_model.py
 import os
+import unicodedata
 import joblib
 import pandas as pd
+from typing import Tuple, Optional
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
 # --- MLflow / DagsHub ---
 import mlflow
-import mlflow.sklearn  # pour log_model
+import mlflow.sklearn
 from mlflow.models.signature import infer_signature
 import dagshub
 
-# Initialise l’intégration DagsHub (affiche l’URL de run dans la console)
+# Initialisation DagsHub / MLflow
 dagshub.init(repo_owner="oumisangare", repo_name="mlops-recettes", mlflow=True)
-
-# Utilise l’URI MLflow via env var si dispo, sinon force l’URL DagsHub
 mlflow.set_tracking_uri(
-    os.getenv("MLFLOW_TRACKING_URI",
-              "https://dagshub.com/oumisangare/mlops-recettes.mlflow")
+    os.getenv("MLFLOW_TRACKING_URI", "https://dagshub.com/oumisangare/mlops-recettes.mlflow")
 )
-
-# Nom d’expérience (tu la verras dans l’onglet Experiments de DagsHub)
 mlflow.set_experiment("recettes-baseline")
 
 
 def load_data(path: str = "recettes.csv") -> pd.DataFrame:
-    return pd.read_csv(path, encoding="utf-8")
+    df = pd.read_csv(path, encoding="utf-8")
+    # Nettoyage défensif
+    df["ingredients"] = df["ingredients"].fillna("").astype(str)
+    df["recipe"] = df["recipe"].fillna("").astype(str)
+    return df
 
 
-def train():
+def should_skip_split(y: pd.Series) -> bool:
+    """On saute le split si dataset minuscule ou classes rares."""
+    vc = y.value_counts()
+    if len(y) < 8:
+        return True
+    if vc.min() < 2:
+        return True
+    return False
+
+
+def build_pipeline() -> Pipeline:
+    # TF-IDF + normalisation des accents, n-grammes (1,2) pour capter des paires
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        strip_accents="unicode",  # "crème" -> "creme"
+        ngram_range=(1, 2),
+        min_df=1
+    )
+    clf = LogisticRegression(
+        max_iter=2000,
+        class_weight="balanced",
+        random_state=42
+    )
+    return Pipeline([("vectorizer", vectorizer), ("classifier", clf)])
+
+
+def train() -> None:
     df = load_data()
     X = df["ingredients"]
     y = df["recipe"]
 
-    # Pipeline: vectorisation + modèle
-    pipeline = Pipeline([
-        ("vectorizer", CountVectorizer()),
-        ("classifier", LogisticRegression(max_iter=1000))
-    ])
+    pipeline = build_pipeline()
 
-    # --- Split robuste pour mini dataset ---
-    value_counts = y.value_counts()
-    can_stratify = (len(y) >= 4) and (value_counts.min() >= 2)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42, stratify=y if can_stratify else None
-    )
+    # Décider split ou non
+    skip_split = should_skip_split(y)
+    if skip_split:
+        X_train, y_train = X, y
+        X_test, y_test = None, None
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, random_state=42, stratify=y
+        )
 
     with mlflow.start_run():
-        # ---- Params loggés
+        # Params
         mlflow.log_param("model", "LogisticRegression")
-        mlflow.log_param("max_iter", 1000)
-        mlflow.log_param("vectorizer", "CountVectorizer")
-        mlflow.log_param("test_size", 0.25)
-        mlflow.log_param("random_state", 42)
-        mlflow.log_param("stratify", bool(can_stratify))
-        mlflow.log_param("n_train", len(X_train))
-        mlflow.log_param("n_test", len(X_test))
+        mlflow.log_param("vectorizer", "Tfidf(1,2)")
+        mlflow.log_param("class_weight", "balanced")
+        mlflow.log_param("skip_split", skip_split)
 
-        # ---- Entraînement
+        # Entraînement
         pipeline.fit(X_train, y_train)
 
-        # ---- Évaluation
-        if len(X_test) > 0:
-            y_pred_test = pipeline.predict(X_test)
-            acc_test = accuracy_score(y_test, y_pred_test)
-            mlflow.log_metric("accuracy_test", float(acc_test))
-        else:
-            acc_test = None
-
+        # Metrics
         acc_train = accuracy_score(y_train, pipeline.predict(X_train))
         mlflow.log_metric("accuracy_train", float(acc_train))
 
-        # ---- Sauvegarde locale (pour l’API)
+        if not skip_split and X_test is not None and len(X_test) > 0:
+            acc_test = accuracy_score(y_test, pipeline.predict(X_test))
+            mlflow.log_metric("accuracy_test", float(acc_test))
+        else:
+            acc_test = None  # pas de test pour mini-dataset
+
+        # Sauvegarde locale pour l'API
         joblib.dump(pipeline, "model_recette.pkl")
 
-        # ---- Signature uniquement (pas d'input_example pour éviter le warning)
-        _sig_in = ["pâtes tomate oignon"]
-        signature = infer_signature(_sig_in, pipeline.predict(_sig_in))
+        # Signature (sans input_example)
+        _sample_in = ["pates tomate oignon"]
+        signature = infer_signature(_sample_in, pipeline.predict(_sample_in))
+        mlflow.sklearn.log_model(pipeline, artifact_path="model", signature=signature)
 
-        mlflow.sklearn.log_model(
-            pipeline,
-            artifact_path="model",
-            signature=signature
-        )
-
-        # (Optionnel) log du dataset utilisé
         if os.path.exists("recettes.csv"):
             mlflow.log_artifact("recettes.csv")
 
         print(
+            f"Accuracy_train={acc_train:.3f} | "
             f"Accuracy_test={acc_test if acc_test is not None else 'NA'} | "
-            f"Accuracy_train={acc_train:.3f} | Modèle sauvegardé dans model_recette.pkl"
+            f"Modèle sauvegardé dans model_recette.pkl"
         )
 
 
