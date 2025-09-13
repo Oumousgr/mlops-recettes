@@ -28,7 +28,7 @@ def predict():
 
     # Prédiction
     prediction = model.predict([input_text])
-    return jsonify({"Recette suggérée par votre thermomix :": prediction[0]})
+    return jsonify({"recette_suggeree": prediction[0]})
 
 if __name__ == "__main__":
     app.run(debug=True)
